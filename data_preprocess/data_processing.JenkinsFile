@@ -1,0 +1,247 @@
+pipeline {
+    agent any
+    options { timestamps(); ansiColor('xterm') }
+    
+    parameters {
+        string(name: 'HF_REPO', description: 'Dataset on HuggingFace (namespace/name)')
+        string(name: 'HF_SUBDIR', defaultValue: '', description: 'Path to data to process on HuggingFace, e.g Turkey/Dobot/Slow_10/22rpm/Chiba, or Turkey if you want to process everything in Turkey')
+        string(name: 'DOWNLOAD_TAG', description: 'Tag on HF to download data to process, if not provided, main is used')
+        string(name: 'TARGET_TAG', description: 'Tag name to create after processing')
+        booleanParam(name: 'SPIKES', defaultValue: false, description: 'On/Off spikes removal')
+        string(name: 'OFFSET', defaultValue: '0.02', description: 'Time offset to skip at the beginning of waveform')
+        choice(name: 'WAVE_WORD_SIZE', choices: ['16', '32'], description: 'Size of word (16 or 32 bits) for saving WAV file')
+        booleanParam(name: 'FORCE_ACQUISITION_REINSTALL', defaultValue: false,
+            description: 'Set true if you want to reinstall acquisition tool for newer version')
+    }
+
+    environment {
+        VENV_DIR = "${WORKSPACE}/venv"
+        WORK_DIR = "${WORKSPACE}/work"
+        VNAV_PKG = "https://github.com/Vibronav/acquisition/archive/master.zip"
+        PIP_DISABLE_PIP_VERSION_CHECK = '1'
+        PIP_NO_CACHE_DIR = '1'
+    }
+
+    stages {
+        stage('Validate params') {
+            steps {
+                script {
+                    if (!params.HF_REPO) {
+                        error "HF_REPO parameter is required"
+                    }
+                    if (!params.TARGET_TAG) {
+                        error "TARGET_TAG parameter is required"
+                    }
+                }
+            }
+        }
+
+        stage('Deps') {
+            steps {
+                sh '''
+                    set -e
+                    PY="$(command -v python3 || command -v python || true)"
+                    if [ -z "$PY" ]; then
+                        echo "Python is not installed" >&2
+                        exit 1
+                    fi
+
+                    "$PY" -m venv "${VENV_DIR}"
+                    . "${VENV_DIR}/bin/activate"
+                    python -m pip install --upgrade pip
+                    pip install --no-input huggingface_hub imageio-ffmpeg==0.4.5
+                    if [ "$FORCE_ACQUISITION_REINSTALL" = true ]; then
+                        pip uninstall -y acquisition
+                        pip install --no-input --no-cache-dir --upgrade --force-reinstall "${VNAV_PKG}"
+                    else
+                        pip install --no-input --upgrade "${VNAV_PKG}"
+                    fi
+
+                '''
+            }
+        }
+
+        stage('Download from HuggingFace') {
+            steps {
+                withCredentials([string(credentialsId: 'HF_TOKEN', variable: 'HF_TOKEN')]) {
+                    sh '''
+                        set -e
+                        rm -rf "${WORK_DIR}"
+                        mkdir -p "${WORK_DIR}"
+                        . "${VENV_DIR}/bin/activate"
+
+                        echo ">> Downloading data from ${HF_REPO}"
+                        python - <<'PY'
+
+import os, sys
+from huggingface_hub import HfApi, hf_hub_download
+
+repo = os.environ['HF_REPO']
+tok = os.environ['HF_TOKEN']
+sub = os.environ.get("HF_SUBDIR", "").strip()
+tag = os.environ.get("DOWNLOAD_TAG", "").strip() or "main"
+
+wanted_dirs = ("audio_raw/",)
+wanted_exts = (".wav",)
+
+def wanted(path):
+    if sub and not path.startswith(sub + "/"):
+        return False
+    if not any(d in path for d in wanted_dirs):
+        return False
+    return path.lower().endswith(wanted_exts)
+
+api = HfApi(token=tok)
+all_files = api.list_repo_files(
+    repo_id=repo,
+    repo_type="dataset",
+    revision=tag
+)
+files = [f for f in all_files if wanted(f)]
+
+if not files:
+    print("No files found")
+    sys.exit(2)
+
+out_root = os.environ['WORK_DIR']
+downloaded = 0
+for rel in files:
+    hf_hub_download(
+        repo_id=repo,
+        repo_type="dataset",
+        filename=rel,
+        revision=tag,
+        token=tok,
+        local_dir=out_root,
+        local_dir_use_symlinks=False
+    )
+    downloaded += 1
+
+print(f"Downloaded {downloaded} files to {out_root}")
+PY
+
+                        find "${WORK_DIR}" -type d -name '.cache' -prune -exec rm -rf '{}' +
+                        FILES=$(find "${WORK_DIR}" -type f -name '*.wav' | wc -l)
+                        echo "Downloaded WAV files: ${FILES}"
+                        if [ "${FILES}" -eq 0 ]; then
+                            echo "No WAV files found, exiting" >&2
+                            exit 1
+                        fi
+                    '''
+
+                }
+            }
+        }
+
+        stage('Process audio -> audio_processed') {
+            steps {
+                sh '''
+                    set -e
+                    . "${VENV_DIR}/bin/activate"
+
+                    mapfile -t ROOTS < <(find "${WORK_DIR}" -type d -name audio_raw -not -path '*/.cache/*' -printf '%h\n' | sort -u)
+                    if [ "${#ROOTS[@]}" -eq 0 ]; then
+                        echo "No audio_raw directories found" >&2
+                        exit 1
+                    fi
+
+                    for root in "${ROOTS[@]}"; do
+                        rel="${root#"$WORK_DIR/"}"
+                        AUDIO_DIR="${root}/audio_raw"
+                        OUT_DIR="${root}/audio_processed"
+                        echo ">> Processing: ${rel}"
+
+                        vnav_wav_process \
+                            --input-path "${AUDIO_DIR}" \
+                            --output-path "${OUT_DIR}" \
+                            --spikes "${SPIKES}" \
+                            --offset "${OFFSET}" \
+                            --wave-word-size "${WAVE_WORD_SIZE}"
+                        
+                    done
+
+                    echo "Processing completed"
+
+                '''
+            }
+        }
+
+        stage('Commit + TAG on HF') {
+            steps {
+                withCredentials([string(credentialsId: 'HF_TOKEN', variable: 'HF_TOKEN')]) {
+
+                    sh '''
+                        set -e
+                        . "${VENV_DIR}/bin/activate"
+
+                        if ! find "${WORK_DIR}" -type f -path '*/audio_processed/*.processed.wav' | grep -q .; then
+                            echo "No processed files found, nothing to commit" >&2
+                            exit 1
+                        fi
+
+                        echo ">> Committing changes to ${HF_REPO}"
+                        python - <<'PY'
+
+import os
+from huggingface_hub import HfApi, upload_folder
+
+repo = os.environ['HF_REPO']
+tok = os.environ['HF_TOKEN']
+sub = os.environ.get("HF_SUBDIR", "").strip()
+tag = os.environ['TARGET_TAG']
+data_dir = os.environ['WORK_DIR']
+
+to_clean = set()
+for root, dirs, files in os.walk(data_dir):
+    if "audio_processed" in dirs:
+        abs_dir = os.path.join(root, "audio_processed")
+        rel_dir = os.path.relpath(abs_dir, data_dir).replace(os.sep, "/")
+        if "/.cache/" in rel_dir:
+            continue
+        to_clean.add(f"{rel_dir}/**/*")
+
+delete_patterns = sorted(to_clean) if to_clean else None
+print(f"Deleting patterns: {delete_patterns}")
+
+commit = upload_folder(
+    repo_id=repo,
+    repo_type="dataset",
+    folder_path=data_dir,
+    token=tok,
+    delete_patterns=delete_patterns,
+    commit_message=f"{sub if sub else ''} processed audio"
+)
+print(f"Committed: {commit.oid} with url: {commit.commit_url}")
+
+api = HfApi(token=tok)
+refs = api.list_repo_refs(
+    repo_id=repo, 
+    repo_type="dataset"
+)
+if any(t.name == tag for t in refs.tags):
+    api.delete_tag(
+        repo_id=repo, 
+        repo_type="dataset", 
+        tag=tag
+    )
+
+api.create_tag(
+    repo_id=repo,
+    repo_type="dataset",
+    tag=tag,
+    revision=commit.oid
+)
+
+PY
+                    '''
+
+                }
+            }
+        }
+    }
+    post {
+        success { echo 'Done' }
+        failure { echo 'Failed' }
+    }
+
+}

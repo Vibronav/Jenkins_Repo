@@ -1,0 +1,264 @@
+pipeline {
+    
+    agent any
+    options { timestamps(); ansiColor('xterm') }
+    
+    parameters {
+        string(name: 'HF_REPO', description: 'Dataset on HuggingFace (namespace/name)')
+        string(name: 'HF_SUBDIR', defaultValue:'',
+         description: 'Path to data to process on HuggingFace, e.g Turkey/Dobot/Slow_10/22rpm/Chiba, or Turkey if you want to process everything in Turkey')
+        string(name: 'DOWNLOAD_TAG', description: 'Tag on HF to download data to synchronize, if not provided, latest commit is used')
+        string(name: 'AUDIO_CHANNEL', defaultValue: '1', description: 'Index of channel in WAV audio file to use for sync (e.g. 0=left, 1=right, -1=last). Default: -1')
+        string(name: 'TARGET_TAG', description: 'Tag name to create after synchronization')
+        booleanParam(name: 'FORCE_ACQUISITION_REINSTALL', defaultValue: false,
+            description: 'Set true if you want to reinstall acquisition tool for newer version')
+    }
+    
+    environment {
+        VENV_DIR = "${WORKSPACE}/.venv"
+        WORK_DIR = "${WORKSPACE}/work"
+        VNAV_PKG = "https://github.com/Vibronav/acquisition/archive/master.zip"
+        PIP_DISABLE_PIP_VERSION_CHECK = '1'
+        PIP_NO_CACHE_DIR = '1'
+    }
+    
+    stages {
+
+        stage('Validate params') {
+            steps {
+                script {
+                    if (!params.HF_REPO) {
+                        error "HF_REPO not set"
+                    }
+                    if (!params.TARGET_TAG) {
+                        error "TARGET_TAG not set"
+                    }
+                }
+            }
+        }
+        
+        stage('Deps') {
+            steps {
+                sh '''
+                    set -e
+                    PY="$(command -v python3 || command -v python || true)"
+                    if [ -z "$PY" ]; then
+                        echo "Python not found on agent" >&2;
+                        exit 1;
+                    fi
+                    # Venv
+                    "$PY" -m venv "${VENV_DIR}"
+                    . "${VENV_DIR}/bin/activate"
+                    python -m pip install --upgrade pip
+                    pip install --no-input huggingface_hub imageio-ffmpeg==0.4.5
+                    if [ "${FORCE_ACQUISITION_REINSTALL}" = "true" ]; then
+                        pip uninstall -y vnav_acquisition
+                        pip install --no-input --no-cache-dir --upgrade --force-reinstall "${VNAV_PKG}"
+                    else
+                        pip install --no-input --upgrade "${VNAV_PKG}"
+                    fi
+                '''
+            }
+        }
+        
+        stage('Download from HuggingFace') {
+            steps {
+                withCredentials([string(credentialsId: 'HF_TOKEN', variable: 'HF_TOKEN')]) {
+                    sh '''
+                        set -e
+                        rm -rf "${WORK_DIR}"
+                        mkdir -p "${WORK_DIR}"
+                        
+                        . "${VENV_DIR}/bin/activate"
+                        
+                        echo ">> Downloading data from ${HF_REPO}"
+                        python - <<'PY'
+import os, sys
+from huggingface_hub import HfApi, hf_hub_download
+repo = os.environ["HF_REPO"]
+tok = os.environ.get("HF_TOKEN")
+sub = os.environ.get("HF_SUBDIR", "").strip()
+tag = os.environ.get("DOWNLOAD_TAG", "").strip() or "main"
+
+def wanted(path):
+
+    if sub and not path.startswith(sub + "/"):
+        return False
+    if not any(d in path for d in wanted_dirs):
+        return False
+    return path.lower().endswith(wanted_exts)
+
+wanted_dirs = ("audio_raw/", "video_cam1/", "video_cam2/")
+wanted_exts = (".wav", ".mp4")
+
+api = HfApi(token=tok)
+    
+all_files = api.list_repo_files(
+    repo_id=repo,
+    repo_type="dataset",
+    revision=tag
+)
+    
+files = [p for p in all_files if wanted(p)]
+
+if not files:
+    print("No matching files found in dataset")
+    sys.exit(2)
+    
+out_root = os.environ["WORK_DIR"]
+downloaded = 0
+
+for rel in files:
+
+    local = hf_hub_download(
+        repo_id=repo,
+        repo_type="dataset",
+        filename=rel,
+        revision=tag,
+        token=tok,
+        local_dir=out_root,
+        local_dir_use_symlinks=False
+    )
+    
+    downloaded += 1
+    
+print(f"Downloaded: {downloaded} files")
+PY
+                        
+                        find "${WORK_DIR}" -type d -name '.cache' -prune -exec rm -rf {} +
+                        FILES=$(find "${WORK_DIR}" -type f | wc -l)
+                        echo "Downloaded files: $FILES"
+                        if [ "$FILES" -eq 0 ]; then
+                          echo "ERROR: Snapshot has no files (probably wrong revision). Aborting to avoid empty commit."
+                          exit 1
+                        fi
+
+                        echo ">> WORK_DIR structure:"
+                        find "${WORK_DIR}" -maxdepth 8 -type d -print
+                    '''
+                }
+            }
+        }
+        
+        stage('Run sync') {
+            steps {
+                sh '''
+                    set -e
+                    . "${VENV_DIR}/bin/activate"
+                    
+                    mapfile -t ROOTS < <(find "${WORK_DIR}" -type d -name audio_raw -not -path '*/.cache/*' -printf '%h\n' | sort -u)
+                    
+                    if [ "${#ROOTS[@]}" -eq 0 ]; then
+                        echo "ERROR: Nothing to process in ${WORK_DIR}" >&2
+                        exit 1
+                    fi
+                    
+                    for root in "${ROOTS[@]}"; do
+                        rel="${root#"$WORK_DIR/"}"
+                        
+                        AUDIO_DIR="${root}/audio_raw"
+                        VIDEO1_DIR="${root}/video_cam1"
+                        VIDEO2_DIR="${root}/video_cam2"
+                        
+                        for d in "${AUDIO_DIR}" "${VIDEO1_DIR}" "${VIDEO2_DIR}"; do
+                            if [ ! -d "$d" ]; then
+                                echo "WARN: Skipping ${rel} (missing: $d)" >&2
+                                continue 2
+                            fi
+                        done
+                        
+                        echo ">> Processing: ${rel}"
+                        vnav_audio_video_sync_new \
+                            --audio-path "${AUDIO_DIR}" \
+                            --first-video-path "${VIDEO1_DIR}" \
+                            --second-video-path "${VIDEO2_DIR}" \
+                            --audio-channel ${AUDIO_CHANNEL}
+                            
+                        echo "Count files in WORK_DIR:"; find "${WORK_DIR}" -type f | wc -l
+                        find "${WORK_DIR}" -maxdepth 2 -type f | head -n 50
+
+                            
+                    done
+                '''
+            }
+        }
+
+        stage('Commit + TAG on HF') {
+            steps {
+                withCredentials([string(credentialsId: 'HF_TOKEN', variable: 'HF_TOKEN')]) {
+                    sh '''
+                        set -e
+                        . "${VENV_DIR}/bin/activate"
+                        
+                        if [ "$(find "${WORK_DIR}" -type f | wc -l)" -eq 0 ]; then
+                            echo "Abort commit: WORK_DIR is empty!"
+                            exit 1
+                        fi
+
+                        python - <<'PY'
+import os
+from huggingface_hub import HfApi, upload_folder
+
+repo_id = os.environ["HF_REPO"]
+token = os.environ["HF_TOKEN"]
+sub = os.environ.get("HF_SUBDIR", "").strip()
+data_dir = os.environ["WORK_DIR"]
+tag_name = os.environ["TARGET_TAG"]
+
+to_clean = set()
+wanted = {"audio_raw", "video_cam1", "video_cam2"}
+
+for root, dirs, files in os.walk(data_dir):
+    for d in list(set(dirs) & wanted):
+        abs_dir = os.path.join(root, d)
+        rel_dir = os.path.relpath(abs_dir, data_dir).replace(os.sep, "/")
+        if "/.cache/" in rel_dir:
+            continue
+        to_clean.add(f"{rel_dir}/**/*")
+        
+delete_patterns = sorted(to_clean) if to_clean else None
+print(f"Delete patterns: {delete_patterns}")
+
+print(f"Committing {data_dir} -> {repo_id}")
+commit = upload_folder(
+    repo_id=repo_id,
+    repo_type="dataset",
+    folder_path=data_dir,
+    token=token,
+    commit_message=f"{sub or ''} Data synchronized",
+    delete_patterns=delete_patterns
+)
+print(f"New commit: {commit.oid} with url: {commit.commit_url}")
+
+api = HfApi(token=token)
+refs = api.list_repo_refs(
+    repo_id=repo_id,
+    repo_type="dataset"
+)
+if any(t.name == tag_name for t in refs.tags):
+    api.delete_tag(
+        repo_id=repo_id,
+        repo_type="dataset",
+        tag=tag_name
+    )
+api.create_tag(
+    repo_id=repo_id,
+    repo_type="dataset",
+    tag=tag_name,
+    revision=commit.oid
+)
+
+PY
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo 'Done!'
+        }
+    }
+    
+}

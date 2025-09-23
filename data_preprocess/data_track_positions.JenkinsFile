@@ -1,0 +1,302 @@
+pipeline {
+    agent any
+    options { timestamps(); ansiColor('xterm') }
+    
+    parameters {
+        string(name: 'HF_REPO', description: 'Dataset on HuggingFace (namespace/name)')
+        string(name: 'HF_SUBDIR', defaultValue: '', description: 'Path to data to process on HuggingFace, e.g Turkey/Dobot/Slow_10/22rpm/Chiba, or Turkey if you want to process everything in Turkey')
+        string(name: 'DOWNLOAD_TAG', description: 'Tag on HF to download data to process, if not provided, main is used')
+        string(name: 'TARGET_TAG', description: 'Tag name to create after processing')
+        choice(name: 'VIDEO_SOURCE', choices: ['video_cam1', 'video_cam2'], description: 'Which camera videos to use')
+
+        booleanParam(name: 'CUBE', defaultValue: true, description: 'Use cube-based ground detection')
+        booleanParam(name: 'DOBOT', defaultValue: false, description: 'Use tracking for dobot or if false to manual')
+        
+        string(name: 'MARKER_LENGTH', description: 'Length of the Aruco marker in cm (From protocol)')
+        string(name: 'MARKER_MARGIN', description: 'Margin around the Aruco marker in cm (From protocol)')
+        string(name: 'NEEDLE_OFFSET', description: 'Needle offset in cm (From protocol)')
+        string(name: 'STARTING_POSITION', defaultValue: '0.0', description: 'Starting position of the needle in cm (default: 0.0 cm). Used only by mode without cube')
+        string(name: 'Z_OFFSET', description: 'Z-axis offset in cm, if not provided default offset will be used')
+        string(name: 'TABLE_OFFSET', defaultValue: '0.0', description: 'E.g. when provided 2cm, level 0 will be 2 cm above table (By default 0.0 cm)')
+        string(name: 'FPS', defaultValue: '30', description: 'Frames per second for video processing (default: 30)')
+        base64File(name: 'DISTANCES_FILE', description: 'distances.txt file to use for annotations, if not provided no annotations will be performed, only tracking positions')
+
+        booleanParam(name: 'FORCE_ACQUISITION_REINSTALL', defaultValue: false, description: 'Force reinstallation of acquisition package')
+    }
+
+    environment {
+        VENV_DIR = "${WORKSPACE}/venv"
+        WORK_DIR = "${WORKSPACE}/work"
+        VNAV_PKG = "https://github.com/Vibronav/acquisition/archive/master.zip"
+        PIP_DISABLE_PIP_VERSION_CHECK = '1'
+        PIP_NO_CACHE_DIR = '1'
+    }
+
+    stages {
+        stage('Validate params') {
+            steps {
+                script {
+                    if (!params.HF_REPO) {
+                        error "HF_REPO parameter is required"
+                    }
+                    if (!params.TARGET_TAG) {
+                        error "TARGET_TAG parameter is required"
+                    }
+                    if(!params.MARKER_LENGTH || !params.MARKER_MARGIN || !params.NEEDLE_OFFSET) {
+                        error "MARKER_LENGTH, MARKER_MARGIN and NEEDLE_OFFSET parameters are required"
+                    }
+                }
+            }
+        }
+
+        stage('Deps') {
+            steps {
+                sh '''
+                    set -e
+                    PY="$(command -v python3 || command -v python || true)"
+                    if [ -z "$PY" ]; then
+                        echo "Python is not installed" >&2
+                        exit 1
+                    fi
+
+                    "$PY" -m venv "${VENV_DIR}"
+                    . "${VENV_DIR}/bin/activate"
+                    python -m pip install --upgrade pip
+                    pip install --no-input huggingface_hub
+                    if [ "$FORCE_ACQUISITION_REINSTALL" = true ]; then
+                        pip uninstall -y acquisition
+                        pip install --no-input --no-cache-dir --upgrade --force-reinstall "${VNAV_PKG}"
+                    else
+                        pip install --no-input --upgrade "${VNAV_PKG}"
+                    fi
+
+                '''
+            }
+        }
+
+        stage('Download from HuggingFace') {
+            steps {
+                withCredentials([string(credentialsId: 'HF_TOKEN', variable: 'HF_TOKEN')]) {
+                    sh '''
+                        set -e
+                        rm -rf "${WORK_DIR}"
+                        mkdir -p "${WORK_DIR}"
+                        . "${VENV_DIR}/bin/activate"
+
+                        echo ">> Downloading data from ${HF_REPO}"
+                        python - <<'PY'
+
+import os, sys
+from huggingface_hub import HfApi, hf_hub_download
+
+repo = os.environ['HF_REPO']
+tok = os.environ['HF_TOKEN']
+sub = os.environ.get("HF_SUBDIR", "").strip()
+tag = os.environ.get("DOWNLOAD_TAG", "").strip() or "main"
+cam = os.environ["VIDEO_SOURCE"]
+
+wanted_exts = (".mp4", ".wav")
+wanted_dirs = (f"{cam}/", "audio_raw/")
+
+def wanted(path):
+    if sub and not path.startswith(sub + "/"):
+        return False
+    if not any(d in path for d in wanted_dirs):
+        return False
+    return path.lower().endswith(wanted_exts)
+
+api = HfApi(token=tok)
+all_files = api.list_repo_files(
+    repo_id=repo,
+    repo_type="dataset",
+    revision=tag
+)
+files = [f for f in all_files if wanted(f)]
+
+if not files:
+    print("No files found")
+    sys.exit(2)
+
+out_root = os.environ['WORK_DIR']
+downloaded = 0
+for rel in files:
+    hf_hub_download(
+        repo_id=repo,
+        repo_type="dataset",
+        filename=rel,
+        revision=tag,
+        token=tok,
+        local_dir=out_root,
+        local_dir_use_symlinks=False
+    )
+    downloaded += 1
+
+print(f"Downloaded {downloaded} files to {out_root}")
+PY
+
+                        find "${WORK_DIR}" -type d -name '.cache' -prune -exec rm -rf '{}' +
+                        FILES=$(find "${WORK_DIR}" -type f -name '*.mp4' | wc -l)
+                        echo "Downloaded MP4 files: ${FILES}"
+                        if [ "${FILES}" -eq 0 ]; then
+                            echo "No MP4 files found, exiting" >&2
+                            exit 1
+                        fi
+                    '''
+
+                }
+            }
+        }
+
+        stage('Process audio -> audio_processed') {
+            steps {
+                withFileParameter('DISTANCES_FILE') {
+                    sh '''
+                        set -e
+                        cp "$DISTANCES_FILE" "${WORK_DIR}/distances.txt"
+                    '''
+                }
+                
+                sh '''
+
+                    set -e
+                    . "${VENV_DIR}/bin/activate"
+
+                    mapfile -t ROOTS < <(find "${WORK_DIR}" -type d -name "${VIDEO_SOURCE}" -not -path '*/.cache/*' -printf '%h\n' | sort -u)
+                    if [ "${#ROOTS[@]}" -eq 0 ]; then
+                        echo "No ${VIDEO_SOURCE} directories found" >&2
+                        exit 1
+                    fi
+
+                    DISTANCES_PATH=""
+                    if [ -f "${WORK_DIR}/distances.txt" ]; then
+                        DISTANCES_PATH="${WORK_DIR}/distances.txt"
+                    fi
+
+                    for root in "${ROOTS[@]}"; do
+                        rel="${root#"$WORK_DIR/"}"
+                        VIDEO_DIR="${root}/${VIDEO_SOURCE}"
+                        AUDIO_DIR="${root}/audio_raw"
+                        echo ">> Processing: ${rel}"
+
+                        ARGS=(
+                            --video-path "${VIDEO_DIR}"
+                            --audio-path "${AUDIO_DIR}"
+                            --marker-length "${MARKER_LENGTH}"
+                            --marker-margin "${MARKER_MARGIN}"
+                            --needle-offset "${NEEDLE_OFFSET}"
+                            --fps "${FPS}"
+                            --table-offset "${TABLE_OFFSET}"
+                        )
+
+                        if [ "${CUBE}" = "true" ]; then
+                            ARGS+=(--cube)
+                        else
+                            ARGS+=(--no-cube)
+                            ARGS+=(--starting-position "${STARTING_POSITION}")
+                        fi
+
+                        if [ "${DOBOT}" = "true" ]; then
+                            ARGS+=(--dobot)
+                        else
+                            ARGS+=(--no-dobot)
+                        fi
+
+                        if [ -n "${Z_OFFSET}" ]; then
+                            ARGS+=(--z-offset "${Z_OFFSET}")
+                        fi
+
+                        if [ -n "${DISTANCES_PATH}" ] && [ -f "${DISTANCES_PATH}" ]; then
+                            ARGS+=(--distances-path "${DISTANCES_PATH}")
+                        fi
+
+                        vnav_annotate_positions "${ARGS[@]}"
+                        
+                    done
+
+                    rm -f "${WORK_DIR}/distances.txt"
+
+                    echo "Processing completed"
+
+                '''
+            }
+        }
+
+        stage('Commit + TAG on HF') {
+            steps {
+                withCredentials([string(credentialsId: 'HF_TOKEN', variable: 'HF_TOKEN')]) {
+
+                    sh '''
+                        set -e
+                        . "${VENV_DIR}/bin/activate"
+
+                        if ! find "${WORK_DIR}" -type f '(' -path '*/labelled_positions/*.csv' -o -path '*/annotations/*.json' ')' | grep -q .; then
+                            echo "No processed files found, nothing to commit" >&2
+                            exit 1
+                        fi
+
+                        echo ">> Committing changes to ${HF_REPO}"
+                        python - <<'PY'
+
+import os
+from huggingface_hub import HfApi, upload_folder
+
+repo = os.environ['HF_REPO']
+tok = os.environ['HF_TOKEN']
+sub = os.environ.get("HF_SUBDIR", "").strip()
+tag = os.environ['TARGET_TAG']
+data_dir = os.environ['WORK_DIR']
+
+to_clean = set()
+for root, dirs, files in os.walk(data_dir):
+    for d in ('labelled_positions', 'annotations'):
+        abs_dir = os.path.join(root, d)
+        rel_dir = os.path.relpath(abs_dir, data_dir).replace(os.sep, "/")
+        if "/.cache/" in rel_dir:
+            continue
+        to_clean.add(f"{rel_dir}/**/*")
+
+delete_patterns = sorted(to_clean) if to_clean else None
+print(f"Deleting patterns: {delete_patterns}")
+
+commit = upload_folder(
+    repo_id=repo,
+    repo_type="dataset",
+    folder_path=data_dir,
+    token=tok,
+    delete_patterns=delete_patterns,
+    commit_message=f"{sub if sub else ''} add tracked positions and annotations"
+)
+print(f"Committed: {commit.oid} with url: {commit.commit_url}")
+
+api = HfApi(token=tok)
+refs = api.list_repo_refs(
+    repo_id=repo, 
+    repo_type="dataset"
+)
+if any(t.name == tag for t in refs.tags):
+    api.delete_tag(
+        repo_id=repo, 
+        repo_type="dataset", 
+        tag=tag
+    )
+
+api.create_tag(
+    repo_id=repo,
+    repo_type="dataset",
+    tag=tag,
+    revision=commit.oid
+)
+
+PY
+                    '''
+
+                }
+            }
+        }
+    }
+    post {
+        success { echo 'Done' }
+        failure { echo 'Failed' }
+    }
+
+}
