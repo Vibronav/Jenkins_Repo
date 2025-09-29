@@ -259,6 +259,10 @@ PY
         success {
             echo 'Done!'
         }
+        always {
+            echo 'Cleaning up workspace'
+            cleanWs(deleteDirs: true, disableDeferredWipeout: true)
+        }
     }
     
 }

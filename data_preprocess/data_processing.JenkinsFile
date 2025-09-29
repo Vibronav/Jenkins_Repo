@@ -242,6 +242,10 @@ PY
     post {
         success { echo 'Done' }
         failure { echo 'Failed' }
+        always {
+            echo 'Cleaning up workspace'
+            cleanWs(deleteDirs: true, disableDeferredWipeout: true)
+        }
     }
 
 }
