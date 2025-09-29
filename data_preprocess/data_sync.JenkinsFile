@@ -261,7 +261,7 @@ PY
         }
         always {
             echo 'Cleaning up workspace'
-            cleanWs(deleteDirs: true, disableDeferredWipeout: true)
+            wipeWorkspace()
         }
     }
     
