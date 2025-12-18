@@ -226,8 +226,7 @@ commit = upload_folder(
     folder_path=data_dir,
     token=token,
     commit_message=f"{sub or ''} Data synchronized",
-    delete_patterns=delete_patterns,
-    multi_commits=True
+    delete_patterns=delete_patterns
 )
 print(f"New commit: {commit.oid} with url: {commit.commit_url}")
 
