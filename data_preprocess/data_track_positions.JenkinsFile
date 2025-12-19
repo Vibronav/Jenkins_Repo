@@ -261,6 +261,12 @@ for root, dirs, files in os.walk(data_dir):
 delete_patterns = sorted(to_clean) if to_clean else None
 print(f"Deleting patterns: {delete_patterns}")
 
+if [ -f "${WORK_DIR}/distances.txt" ]; then
+    commit_msg = f"{sub if sub else ''} add tracked positions and annotations"
+else:
+    commit_msg = f"{sub if sub else ''} add tracked positions"
+fi
+
 commit = upload_folder(
     repo_id=repo,
     repo_type="dataset",
