@@ -32,8 +32,8 @@ pipeline {
         PIP_NO_CACHE_DIR = '1'
         HAS_DISTANCES = "false"
 
-        HF_HUB_HTTP_TIMEOUT = '300'
-        HF_HUB_ETAG_TIMEOUT = '60'
+        HF_HUB_HTTP_TIMEOUT = '1200'
+        HF_HUB_ETAG_TIMEOUT = '300'
     }
 
     stages {
