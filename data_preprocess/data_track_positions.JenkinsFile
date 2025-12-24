@@ -30,6 +30,7 @@ pipeline {
         VNAV_PKG = "https://github.com/Vibronav/acquisition/archive/master.zip"
         PIP_DISABLE_PIP_VERSION_CHECK = '1'
         PIP_NO_CACHE_DIR = '1'
+        HAS_DISTANCES = "false"
 
         HF_HUB_HTTP_TIMEOUT = '300'
         HF_HUB_ETAG_TIMEOUT = '60'
@@ -152,6 +153,13 @@ PY
 
         stage('Process audio -> audio_processed') {
             steps {
+
+                script {
+                    if(params.DISTANCES_FILE) {
+                        env.HAS_DISTANCES = "true"
+                    }
+                }
+
                 withFileParameter('DISTANCES_FILE') {
                     sh '''
                         set -e
@@ -248,6 +256,7 @@ tok = os.environ['HF_TOKEN']
 sub = os.environ.get("HF_SUBDIR", "").strip()
 tag = os.environ['TARGET_TAG']
 data_dir = os.environ['WORK_DIR']
+has_distances = os.environ.get("HAS_DISTANCES", "false").lower() == "true"
 
 to_clean = set()
 for root, dirs, files in os.walk(data_dir):
@@ -261,11 +270,10 @@ for root, dirs, files in os.walk(data_dir):
 delete_patterns = sorted(to_clean) if to_clean else None
 print(f"Deleting patterns: {delete_patterns}")
 
-if [ -f "${WORK_DIR}/distances.txt" ]; then
+if has_distances:
     commit_msg = f"{sub if sub else ''} add tracked positions and annotations"
 else:
     commit_msg = f"{sub if sub else ''} add tracked positions"
-fi
 
 commit = upload_folder(
     repo_id=repo,
@@ -273,7 +281,7 @@ commit = upload_folder(
     folder_path=data_dir,
     token=tok,
     delete_patterns=delete_patterns,
-    commit_message=f"{sub if sub else ''} add tracked positions and annotations"
+    commit_message=commit_msg
 )
 print(f"Committed: {commit.oid} with url: {commit.commit_url}")
 
