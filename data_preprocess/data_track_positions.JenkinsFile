@@ -249,7 +249,7 @@ PY
                         python - <<'PY'
 
 import os
-from huggingface_hub import HfApi, upload_folder
+from huggingface_hub import HfApi, CommitOperationDelete
 
 repo = os.environ['HF_REPO']
 tok = os.environ['HF_TOKEN']
@@ -258,32 +258,43 @@ tag = os.environ['TARGET_TAG']
 data_dir = os.environ['WORK_DIR']
 has_distances = os.environ.get("HAS_DISTANCES", "false").lower() == "true"
 
-to_clean = set()
+api = HfApi(token=token)
+
+delete_prefixes = set()
 for root, dirs, files in os.walk(data_dir):
     for d in ('labelled_positions', 'annotations'):
         abs_dir = os.path.join(root, d)
         rel_dir = os.path.relpath(abs_dir, data_dir).replace(os.sep, "/")
         if "/.cache/" in rel_dir:
             continue
-        to_clean.add(f"{rel_dir}/**/*")
+        delete_prefixes.add(rel_dir.rstrip("/") + "/")
 
-delete_patterns = sorted(to_clean) if to_clean else None
-print(f"Deleting patterns: {delete_patterns}")
+delete_prefixes = sorted(delete_prefixes)
+print(f"Deleting patterns: {delete_prefixes}")
 
-if has_distances:
-    commit_msg = f"{sub if sub else ''} add tracked positions and annotations"
+all_repo_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision="main")
+to_delete = [f for f in all_repo_files if any(f.startswith(p) for p in delete_prefixes)]
+print(f"Files to delete: {len(to_delete)}")
+
+if to_delete:
+    ops = [CommitOperationDelete(path_in_repo=f) for f in to_delete]
+    api.create_commit(
+        repo_id=repo_id,
+        repo_type="dataset",
+        operations=ops,
+        commit_message=f"{sub or ''} Clean before labelled_positions and annotations",
+    )
 else:
-    commit_msg = f"{sub if sub else ''} add tracked positions"
+    print("Nothing to delete on remote for these prefixes.")
 
-commit = upload_folder(
+commit = api.upload_large_folder(
     repo_id=repo,
     repo_type="dataset",
-    folder_path=data_dir,
-    token=tok,
-    delete_patterns=delete_patterns,
-    commit_message=commit_msg
+    folder_path=data_dir
 )
-print(f"Committed: {commit.oid} with url: {commit.commit_url}")
+
+head_sha = api.list_repo_commits(repo_id=repo_id, repo_type="dataset", revision="main")[0].commit_id
+print(f"New commit (head): {head_sha}")
 
 api = HfApi(token=tok)
 refs = api.list_repo_refs(
@@ -301,7 +312,7 @@ api.create_tag(
     repo_id=repo,
     repo_type="dataset",
     tag=tag,
-    revision=commit.oid
+    revision=head_sha
 )
 
 PY
