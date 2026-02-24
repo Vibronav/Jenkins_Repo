@@ -200,7 +200,7 @@ PY
 
                         python - <<'PY'
 import os
-from huggingface_hub import HfApi, upload_folder
+from huggingface_hub import HfApi
 
 repo_id = os.environ["HF_REPO"]
 token = os.environ["HF_TOKEN"]
@@ -222,8 +222,10 @@ for root, dirs, files in os.walk(data_dir):
 delete_patterns = sorted(to_clean) if to_clean else None
 print(f"Delete patterns: {delete_patterns}")
 
+api = HfApi(token=token)
+
 print(f"Committing {data_dir} -> {repo_id}")
-commit = upload_folder(
+commit = api.upload_large_folder(
     repo_id=repo_id,
     repo_type="dataset",
     folder_path=data_dir,
@@ -231,9 +233,11 @@ commit = upload_folder(
     commit_message=f"{sub or ''} Data synchronized",
     delete_patterns=delete_patterns
 )
-print(f"New commit: {commit.oid} with url: {commit.commit_url}")
 
-api = HfApi(token=token)
+head_sha = api.list_repo_commits(repo_id=repo_id, repo_type="dataset", revision="main")[0].commit_id
+print(f"New commit (head): {head_sha}")
+
+
 refs = api.list_repo_refs(
     repo_id=repo_id,
     repo_type="dataset"
@@ -248,7 +252,7 @@ api.create_tag(
     repo_id=repo_id,
     repo_type="dataset",
     tag=tag_name,
-    revision=commit.oid
+    revision=head_sha
 )
 
 PY
