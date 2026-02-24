@@ -118,7 +118,7 @@ for rel in files:
         repo_type="dataset",
         filename=rel,
         revision=tag,
-        token=tok,
+        token=token,
         local_dir=out_root,
         local_dir_use_symlinks=False
     )
