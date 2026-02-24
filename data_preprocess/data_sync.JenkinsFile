@@ -200,7 +200,7 @@ PY
 
                         python - <<'PY'
 import os
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, CommitOperationDelete
 
 repo_id = os.environ["HF_REPO"]
 token = os.environ["HF_TOKEN"]
@@ -208,7 +208,9 @@ sub = os.environ.get("HF_SUBDIR", "").strip()
 data_dir = os.environ["WORK_DIR"]
 tag_name = os.environ["TARGET_TAG"]
 
-to_clean = set()
+api = HfApi(token=token)
+
+delete_prefixes = set()
 wanted = {"audio_raw", "video_cam1", "video_cam2"}
 
 for root, dirs, files in os.walk(data_dir):
@@ -217,20 +219,31 @@ for root, dirs, files in os.walk(data_dir):
         rel_dir = os.path.relpath(abs_dir, data_dir).replace(os.sep, "/")
         if "/.cache/" in rel_dir:
             continue
-        to_clean.add(f"{rel_dir}/**/*")
+        delete_prefixes.add(rel_dir.rstrip("/") + "/")
         
-delete_patterns = sorted(to_clean) if to_clean else None
-print(f"Delete patterns: {delete_patterns}")
+delete_prefixes = sorted(delete_prefixes)
+print(f"Delete prefixes: {delete_prefixes}")
 
-api = HfApi(token=token)
+all_repo_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision="main")
+to_delete = [f for f in all_repo_files if any(f.startswith(p) for p in delete_prefixes)]
+
+print(f"Files to delete: {len(to_delete)}")
+if to_delete:
+    ops = [CommitOperationDelete(path_in_repo=f) for f in to_delete]
+    api.create_commit(
+        repo_id=repo_id,
+        repo_type="dataset",
+        operations=ops,
+        commit_message=f"{sub or ''} Clean before sync",
+    )
+else:
+    print("Nothing to delete on remote for these prefixes.")
 
 print(f"Committing {data_dir} -> {repo_id}")
 commit = api.upload_large_folder(
     repo_id=repo_id,
     repo_type="dataset",
-    folder_path=data_dir,
-    commit_message=f"{sub or ''} Data synchronized",
-    delete_patterns=delete_patterns
+    folder_path=data_dir
 )
 
 head_sha = api.list_repo_commits(repo_id=repo_id, repo_type="dataset", revision="main")[0].commit_id
