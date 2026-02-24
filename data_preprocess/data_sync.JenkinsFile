@@ -79,7 +79,7 @@ pipeline {
 import os, sys
 from huggingface_hub import HfApi, hf_hub_download
 repo = os.environ["HF_REPO"]
-tok = os.environ.get("HF_TOKEN")
+token = os.environ.get("HF_TOKEN")
 sub = os.environ.get("HF_SUBDIR", "").strip()
 tag = os.environ.get("DOWNLOAD_TAG", "").strip() or "main"
 
@@ -94,7 +94,7 @@ def wanted(path):
 wanted_dirs = ("audio_raw/", "video_cam1/", "video_cam2/")
 wanted_exts = (".wav", ".mp4")
 
-api = HfApi(token=tok)
+api = HfApi(token=token)
     
 all_files = api.list_repo_files(
     repo_id=repo,
