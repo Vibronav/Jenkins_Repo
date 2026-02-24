@@ -279,7 +279,7 @@ print(f"Files to delete: {len(to_delete)}")
 if to_delete:
     ops = [CommitOperationDelete(path_in_repo=f) for f in to_delete]
     api.create_commit(
-        repo_id=repo_id,
+        repo_id=repo,
         repo_type="dataset",
         operations=ops,
         commit_message=f"{sub or ''} Clean before labelled_positions and annotations",
