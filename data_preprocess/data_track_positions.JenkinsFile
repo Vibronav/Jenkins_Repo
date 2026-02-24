@@ -261,8 +261,9 @@ has_distances = os.environ.get("HAS_DISTANCES", "false").lower() == "true"
 api = HfApi(token=token)
 
 delete_prefixes = set()
+wanted = {"labelled_positions", "annotations"}
 for root, dirs, files in os.walk(data_dir):
-    for d in ('labelled_positions', 'annotations'):
+    for d in list(set(dirs) & wanted):
         abs_dir = os.path.join(root, d)
         rel_dir = os.path.relpath(abs_dir, data_dir).replace(os.sep, "/")
         if "/.cache/" in rel_dir:
